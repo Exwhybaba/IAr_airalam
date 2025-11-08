@@ -99,9 +99,9 @@ function computeLabMetrics(group){
   // Severity based on density thresholds if available
   let severity = undefined
   if (typeof density_per_ul === 'number'){
-    if (density_per_ul > 100000) severity = 'Severe'
-    else if (density_per_ul >= 10000) severity = 'Moderate'
-    else if (density_per_ul > 0) severity = 'Mild'
+    if (density_per_ul > 100_000) severity = 'Severe'
+    else if (density_per_ul < 100_000) severity = 'Moderate'
+    else if (0 < density_per_ul <= 1_000) severity = 'Low'
     else severity = 'None'
   }
 
