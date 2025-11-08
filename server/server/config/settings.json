@@ -1,0 +1,14 @@
+{
+  "INFER_UPSTREAM_URL": "http://127.0.0.1:7000/api/v1/infer",
+  "INFER_ASSET_BASE": "",
+  "CONF": 0.25,
+  "WBCS_PER_UL_DEFAULT": 8000,
+  "WRITE_MEM_ALWAYS": false,
+  "ORG_NAME": "Central Medical Laboratory",
+  "ORG_EMAIL": "info@centrallab.org",
+  "ORG_PHONE": "",
+  "ORG_ADDRESS": "",
+  "LOGO_URL": "",
+  "NOTIFY_EMAILS_ENABLED": true,
+  "LOW_CONF_ALERTS_ENABLED": false
+}
