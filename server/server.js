@@ -17,20 +17,13 @@ const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb:/
 // -----------------------
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true) // allow server-to-server requests
-
-    // Allowed origins
+    if (!origin) return callback(null, true)
     const allowed = [
-      'https://malariaai.vercel.app', // main frontend
-      'http://localhost:5173',        // local dev
-      'http://localhost:3000'         // local dev
+      'https://malariaai.vercel.app',
+      'http://localhost:5173',
+      'http://localhost:3000'
     ]
-
-    // Allow any Vercel preview deployment
-    if (allowed.indexOf(origin) !== -1 || /\.vercel\.app$/.test(origin)) {
-      return callback(null, true)
-    }
-
+    if (allowed.indexOf(origin) !== -1 || /\.vercel\.app$/.test(origin)) return callback(null, true)
     return callback(new Error(`CORS policy: origin '${origin}' not allowed`), false)
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
@@ -57,24 +50,15 @@ app.use('/api/v1', inferRoutes)
 app.use('/api/v1', resultsRoutes)
 app.use('/api/v1', settingsRoutes)
 
-// Friendly landing page
+// Landing page
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
   <html>
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>MalariaAI Node API</title>
-      <style>
-        body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; padding: 2rem; line-height: 1.6; color: #111; }
-        code { background: #f3f4f6; padding: .2rem .4rem; border-radius: .25rem; }
-        a { color: #b91c1c; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-      </style>
-    </head>
+    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MalariaAI Node API</title></head>
     <body>
       <h1>MalariaAI Node API</h1>
-      <p>Server is running on <code>http://localhost:${PORT}</code>.</p>
+      <p>Server running on <code>http://localhost:${PORT}</code></p>
       <ul>
         <li>Health: <a href="/health">/health</a></li>
         <li>Infer (POST): <code>/api/v1/infer</code></li>
@@ -85,7 +69,7 @@ app.get('/', (_req, res) => {
   </html>`)
 })
 
-// Health route
+// Health
 import { getSettings } from './store/config.js'
 app.get('/health', (_req,res)=>{
   const s = getSettings()
@@ -99,7 +83,7 @@ app.get('/health', (_req,res)=>{
 })
 
 // -----------------------
-// MongoDB connection and server start
+// MongoDB connect and start
 // -----------------------
 connectMongo(MONGO_URI)
   .then(() => {
