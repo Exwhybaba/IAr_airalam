@@ -10,52 +10,54 @@ import settingsRoutes from './routes/settings.routes.js'
 
 const app = express()
 const PORT = Number(process.env.PORT || 5000)
-// Prefer explicit env; fallback to IPv4 localhost to avoid ::1 issues
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/malariaai'
 
-// ---------------- CORS SETUP ----------------
-// Use a dynamic function to allow:
-// 1. Main domain
-// 2. Any Vercel preview deployment (*.vercel.app)
-// 3. localhost for dev
+// -----------------------
+// CORS configuration
+// -----------------------
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true) // allow server-to-server / curl
+    if (!origin) return callback(null, true) // allow server-to-server requests
 
+    // Allowed origins
     const allowed = [
-      'https://malariaai.vercel.app',
-      'http://localhost:5173',
-      'http://localhost:3000'
+      'https://malariaai.vercel.app', // main frontend
+      'http://localhost:5173',        // local dev
+      'http://localhost:3000'         // local dev
     ]
 
-    // Allow main domain OR localhost OR any Vercel preview subdomain
+    // Allow any Vercel preview deployment
     if (allowed.indexOf(origin) !== -1 || /\.vercel\.app$/.test(origin)) {
       return callback(null, true)
     }
 
-    const msg = `CORS policy: origin '${origin}' not allowed`
-    return callback(new Error(msg), false)
+    return callback(new Error(`CORS policy: origin '${origin}' not allowed`), false)
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','X-Requested-With','Accept'],
   credentials: true
 }))
 
-// ---------------- EXPRESS SETUP ----------------
+// -----------------------
+// Middleware
+// -----------------------
 app.use(express.json())
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const ROOT = path.resolve(__dirname)
+
 app.use('/uploads', express.static(path.join(ROOT,'uploads')))
 app.use('/assets', express.static(path.join(ROOT,'public')))
 
-// ---------------- ROUTES ----------------
+// -----------------------
+// Routes
+// -----------------------
 app.use('/api/v1', inferRoutes)
 app.use('/api/v1', resultsRoutes)
 app.use('/api/v1', settingsRoutes)
 
-// ---------------- LANDING PAGE ----------------
+// Friendly landing page
 app.get('/', (_req, res) => {
   res.type('html').send(`<!doctype html>
   <html>
@@ -63,7 +65,12 @@ app.get('/', (_req, res) => {
       <meta charset="utf-8" />
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <title>MalariaAI Node API</title>
-      <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:2rem;line-height:1.6;color:#111} code{background:#f3f4f6;padding:.2rem .4rem;border-radius:.25rem} a{color:#b91c1c;text-decoration:none} a:hover{text-decoration:underline}</style>
+      <style>
+        body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; padding: 2rem; line-height: 1.6; color: #111; }
+        code { background: #f3f4f6; padding: .2rem .4rem; border-radius: .25rem; }
+        a { color: #b91c1c; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+      </style>
     </head>
     <body>
       <h1>MalariaAI Node API</h1>
@@ -78,28 +85,35 @@ app.get('/', (_req, res) => {
   </html>`)
 })
 
+// Health route
 import { getSettings } from './store/config.js'
 app.get('/health', (_req,res)=>{
   const s = getSettings()
-  res.json({
-    status: 'ok',
-    upstream: s.INFER_UPSTREAM_URL || null,
-    wbcs_per_ul_default: s.WBCS_PER_UL_DEFAULT,
-    conf: s.CONF,
-    iou: s.IOU
+  res.json({ 
+    status: 'ok', 
+    upstream: s.INFER_UPSTREAM_URL || null, 
+    wbcs_per_ul_default: s.WBCS_PER_UL_DEFAULT, 
+    conf: s.CONF, 
+    iou: s.IOU 
   })
 })
 
-// ---------------- CONNECT MONGO AND START SERVER ----------------
-connectMongo(MONGO_URI).then(()=>{
-  console.log('MongoDB connected')
-  app.listen(PORT, () => console.log(`Node API listening on http://localhost:${PORT}`))
-}).catch(err=>{
-  console.warn('MongoDB connect failed:', err.message)
-  app.listen(PORT, () => console.log(`Node API listening on http://localhost:${PORT}`))
-})
+// -----------------------
+// MongoDB connection and server start
+// -----------------------
+connectMongo(MONGO_URI)
+  .then(() => {
+    console.log('MongoDB connected')
+    app.listen(PORT, () => console.log(`Node API listening on http://localhost:${PORT}`))
+  })
+  .catch(err => {
+    console.warn('MongoDB connect failed:', err.message)
+    app.listen(PORT, () => console.log(`Node API listening on http://localhost:${PORT}`))
+  })
 
-// ---------------- FALLBACK 404 ----------------
+// -----------------------
+// Fallback 404
+// -----------------------
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found', method: req.method, path: req.path })
 })
