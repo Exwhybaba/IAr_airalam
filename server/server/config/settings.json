@@ -1,6 +1,6 @@
 {
-  "INFER_UPSTREAM_URL": "http://127.0.0.1:7000/api/v1/infer",
-  "INFER_ASSET_BASE": "",
+  "INFER_UPSTREAM_URL": "https://iar-airalam.onrender.com/api/v1/infer",
+  "INFER_ASSET_BASE": "https://iar-airalam.onrender.com/",
   "CONF": 0.25,
   "WBCS_PER_UL_DEFAULT": 8000,
   "WRITE_MEM_ALWAYS": false,
