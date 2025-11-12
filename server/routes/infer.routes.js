@@ -59,7 +59,7 @@ router.post('/infer', upload.single('file'), async (req, res) => {
       httpsAgent: agent,
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
-      timeout: 60000
+      timeout: 180000
     })
 
     const py = r.data
