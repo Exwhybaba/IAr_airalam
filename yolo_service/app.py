@@ -1,13 +1,17 @@
+# yolo_service/app.py
 import os
 import sys
 import platform
 import uuid
+import signal
+import traceback
 from datetime import datetime
 from collections import Counter
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import cv2
+
 YOLO = None
 _YOLO_IMPORT_ERROR = None
 _DLL_DIRS_ADDED = []
@@ -16,13 +20,10 @@ _DLL_DIRS_ADDED = []
 if os.name == 'nt':
     try:
         candidates = []
-        # Site-packages under the active interpreter/venv
         candidates.append(os.path.join(sys.prefix, 'Lib', 'site-packages', 'torch', 'lib'))
-        # Any site-packages path on sys.path
         for p in list(sys.path):
             if p and p.lower().endswith('site-packages'):
                 candidates.append(os.path.join(p, 'torch', 'lib'))
-        # Local fallback relative to this file (useful if launched from IDE)
         _this_dir = os.path.abspath(os.path.dirname(__file__))
         candidates.append(os.path.join(_this_dir, 'myenv', 'Lib', 'site-packages', 'torch', 'lib'))
         seen = set()
@@ -31,27 +32,31 @@ if os.name == 'nt':
                 c = os.path.normpath(c)
                 if c and c not in seen and os.path.isdir(c):
                     seen.add(c)
-                    # Prefer the modern AddDllDirectory when available (Py3.8+)
                     if hasattr(os, 'add_dll_directory'):
                         os.add_dll_directory(c)
-                    # Also prepend to PATH to help any child process/tools
                     os.environ['PATH'] = c + os.pathsep + os.environ.get('PATH', '')
                     _DLL_DIRS_ADDED.append(c)
             except Exception:
                 pass
-        # Work around possible OpenMP duplicate load issues in some PATH setups
         os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
     except Exception:
-        # Best-effort — keep running even if this fails
         pass
+
+# Defer ultralytics import so app can start even if torch isn't available
 try:
-    # Defer import so the app can start even if Torch GPU DLLs are missing
     from ultralytics import YOLO as _YOLO
     YOLO = _YOLO
 except Exception as e:
     _YOLO_IMPORT_ERROR = str(e)
     print(f"[ERROR] Failed to import ultralytics/torch: {e}")
 
+# Try import torch for device management and cache control
+_torch = None
+try:
+    import torch as _t
+    _torch = _t
+except Exception as _te:
+    print("[WARN] torch not available:", _te)
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
@@ -80,6 +85,17 @@ MODEL_PATH = pick_model_path()
 CONF = float(os.environ.get('CONF', '0.25'))
 IOU = float(os.environ.get('IOU', '0.45'))
 IMGSZ = int(os.environ.get('IMGSZ', '640'))
+
+# Device selection: prefer cuda if available and torch present
+DEVICE = 'cpu'
+if _torch is not None:
+    try:
+        if _torch.cuda.is_available():
+            DEVICE = 'cuda'
+        else:
+            DEVICE = 'cpu'
+    except Exception:
+        DEVICE = 'cpu'
 
 app = Flask(__name__)
 CORS(app)
@@ -110,6 +126,7 @@ if YOLO is not None:
         try:
             if os.path.isfile(p):
                 print(f"[INFO] Attempting to load model: {p}")
+                # ultralytics YOLO will accept path and device later when called
                 model = YOLO(p)
                 MODEL_PATH = p
                 print("[INFO] Model loaded successfully")
@@ -120,10 +137,8 @@ if YOLO is not None:
             _MODEL_ERRORS.append(f"{p}: {e}")
             print(f"[ERROR] Failed to load YOLO model at {p}: {e}")
 
-
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'png','jpg','jpeg','bmp','tiff'}
-
 
 @app.get('/health')
 def health():
@@ -134,13 +149,15 @@ def health():
         cls = {}
     torch_info = {}
     try:
-        import torch as _t
-        cuda_v = getattr(getattr(_t, 'version', None), 'cuda', None)
-        torch_info = {
-            'version': getattr(_t, '__version__', None),
-            'cuda': cuda_v,
-            'debug': getattr(_t, 'version', None) is not None and getattr(_t.version, 'debug', False)
-        }
+        if _torch is not None:
+            cuda_v = getattr(getattr(_torch, 'version', None), 'cuda', None)
+            torch_info = {
+                'version': getattr(_torch, '__version__', None),
+                'cuda': cuda_v,
+                'debug': getattr(_torch, '__version__', None) is not None and getattr(_torch, 'debug', False)
+            }
+        else:
+            torch_info = { 'available': False }
     except Exception as _te:
         torch_info = { 'error': str(_te) }
     return jsonify({
@@ -166,7 +183,6 @@ def health():
         },
     })
 
-
 @app.get('/')
 def index():
     return (
@@ -185,6 +201,7 @@ def index():
       <li>Infer (POST): <code>/api/v1/infer</code></li>
       <li>Infer Batch (POST): <code>/api/v1/infer/batch</code></li>
       <li>Static outputs: <code>/static/outputs/...</code></li>
+      <li>Debug infer: <a href='/debug/infer_test'>/debug/infer_test</a></li>
     </ul>
   </body>
 </html>""",
@@ -192,21 +209,54 @@ def index():
         {"Content-Type": "text/html; charset=utf-8"},
     )
 
-
 @app.get('/favicon.ico')
 def favicon():
     return ("", 204)
 
+# Signal handlers so Render kills (SIGTERM) are visible in logs
+def _on_term(signum, frame):
+    print(f"[SIGNAL] Received signal {signum} - exiting")
+    sys.stdout.flush()
+
+try:
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+except Exception:
+    pass
 
 def run_infer_save(image_path: str, conf: float, iou: float):
+    """
+    Runs inference on the saved image path, writes an annotated output to OUTPUT_DIR,
+    and returns (detections_list, out_name, summary)
+    """
     if model is None:
         return [], None, {}
+    # Read image
     image = cv2.imread(image_path)
     if image is None:
         return [], None, {}
     img_h, img_w = image.shape[:2]
-    results = model.predict(source=image_path, conf=conf, iou=iou, imgsz=IMGSZ, device='cpu', verbose=False)
-    r = results[0]
+    try:
+        # Use torch.no_grad() if torch is available
+        if _torch is not None:
+            with _torch.no_grad():
+                results = model.predict(source=image_path, conf=conf, iou=iou, imgsz=IMGSZ, device=DEVICE, verbose=False)
+        else:
+            # fallback if torch not available
+            results = model.predict(source=image_path, conf=conf, iou=iou, imgsz=IMGSZ, device='cpu', verbose=False)
+        r = results[0]
+    except Exception as e:
+        # Log full traceback to Render logs
+        print("[ERROR] Inference failed:", str(e))
+        traceback.print_exc()
+        # attempt to free GPU memory and return an error summary
+        try:
+            if _torch is not None:
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return [], None, {'error': str(e)}
+
     names = getattr(r, 'names', getattr(model, 'names', {}))
     try:
         boxes = r.boxes.xyxy.tolist()
@@ -215,53 +265,63 @@ def run_infer_save(image_path: str, conf: float, iou: float):
     except Exception:
         boxes, classes, scores = [], [], []
 
-    # build detections list and counts
     dets = []
     counter = Counter()
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    try:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    except Exception:
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image is not None else None
+
     for box, cls_id, sc in zip(boxes, classes, scores):
-        x1, y1, x2, y2 = map(int, box)
-        label = str(names[int(cls_id)] if isinstance(names, dict) and int(cls_id) in names else names[int(cls_id)] if isinstance(names, list) and int(cls_id) < len(names) else f"class_{int(cls_id)}")
-        counter[label] += 1
-        cv2.rectangle(image_rgb, (x1, y1), (x2, y2), (255, 0, 0), 4)
-        cv2.putText(image_rgb, f"{label} {sc:.2f}", (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
-        dets.append({
-            'class_id': int(cls_id),
-            'label': label,
-            'score': float(sc),
-            'bbox': {'x': float(x1), 'y': float(y1), 'w': float(x2-x1), 'h': float(y2-y1)}
-        })
-    out_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    out_name = f"processed_{uuid.uuid4().hex}.jpg"
-    out_path = os.path.join(OUTPUT_DIR, out_name)
-    cv2.imwrite(out_path, out_bgr)
+        try:
+            x1, y1, x2, y2 = map(int, box)
+            label = str(names[int(cls_id)] if isinstance(names, dict) and int(cls_id) in names else names[int(cls_id)] if isinstance(names, list) and int(cls_id) < len(names) else f"class_{int(cls_id)}")
+            counter[label] += 1
+            if image_rgb is not None:
+                cv2.rectangle(image_rgb, (x1, y1), (x2, y2), (255, 0, 0), 4)
+                cv2.putText(image_rgb, f"{label} {sc:.2f}", (x1, max(0, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
+            dets.append({
+                'class_id': int(cls_id),
+                'label': label,
+                'score': float(sc),
+                'bbox': {'x': float(x1), 'y': float(y1), 'w': float(x2-x1), 'h': float(y2-y1)}
+            })
+        except Exception:
+            continue
+
+    out_bgr = None
+    out_name = None
+    try:
+        if image_rgb is not None:
+            out_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+            out_name = f"processed_{uuid.uuid4().hex}.jpg"
+            out_path = os.path.join(OUTPUT_DIR, out_name)
+            cv2.imwrite(out_path, out_bgr)
+    except Exception as e:
+        print("[WARN] Failed to write annotated image:", e)
+        traceback.print_exc()
 
     total = sum(counter.values())
-    # Derived metrics
     area_mpx = max(1e-9, float(img_w * img_h) / 1_000_000.0)
     density_per_mpx = float(total) / area_mpx if area_mpx > 0 else float(total)
     avg_conf = float(sum(scores) / len(scores)) if scores else 0.0
-    if total > 100_000:
+
+    # severity thresholds (explicit comparisons)
+    if total > 100000:
         severity = 'Severe'
-    elif total < 100_000:
+    elif total > 1000:
         severity = 'Moderate'
-    elif 0 < total <= 1_000:
+    elif total > 0:
         severity = 'Low'
     else:
         severity = 'None'
-    # Specific category counts to aid downstream clinical metrics
+
     trophozoites = 0
     wbcs = 0
     for k, v in counter.items():
         name = str(k).lower()
-        # Trophozoites (asexual) — include targeted synonyms only
-        # Avoid broad terms like 'infect' or 'plasmo' that may match RBC labels
-        if (
-            'troph' in name or 'tropho' in name or 'ring' in name or
-            'parasite' in name or name in ('trophozoite', 'ring form', 'parasite')
-        ):
+        if ('troph' in name or 'tropho' in name or 'ring' in name or 'parasite' in name or name in ('trophozoite', 'ring form', 'parasite')):
             trophozoites += int(v)
-        # WBCs — common synonyms
         if ('wbc' in name or 'white blood' in name or 'leukocyte' in name or name == 'wbc'):
             wbcs += int(v)
 
@@ -279,63 +339,133 @@ def run_infer_save(image_path: str, conf: float, iou: float):
         'density_per_megapixel': float(density_per_mpx),
         'avg_confidence': float(avg_conf)
     }
+
+    # free GPU cache if available
+    try:
+        if _torch is not None:
+            _torch.cuda.empty_cache()
+    except Exception:
+        pass
+
     return dets, out_name, summary
 
-
+# Robust endpoint: single inference with full traceback logging
 @app.post('/api/v1/infer')
 def infer_single():
-    f = request.files.get('file') or request.files.get('image')
-    conf = float(request.args.get('conf', CONF))
-    iou = float(request.args.get('iou', IOU))
-    if not f or not allowed_file(f.filename):
-        return jsonify({'error': 'file is required'}), 400
-    fn = f"{int(datetime.utcnow().timestamp()*1000)}_{uuid.uuid4().hex}_{f.filename}"
-    up = os.path.join(UPLOAD_DIR, fn)
-    f.save(up)
-    dets, out_name, summary = run_infer_save(up, conf, iou)
-    annotated_url = f"/static/outputs/{out_name}" if out_name else None
-    return jsonify({
-        'detections': dets,
-        'summary': summary,
-        'annotated_image_url': annotated_url,
-        'source_filename': f.filename
-    })
+    try:
+        f = request.files.get('file') or request.files.get('image')
+        conf = float(request.args.get('conf', CONF))
+        iou = float(request.args.get('iou', IOU))
+        if not f or not allowed_file(f.filename):
+            return jsonify({'error': 'file is required'}), 400
 
+        fn = f"{int(datetime.utcnow().timestamp()*1000)}_{uuid.uuid4().hex}_{f.filename}"
+        up = os.path.join(UPLOAD_DIR, fn)
+        f.save(up)
 
+        dets, out_name, summary = run_infer_save(up, conf, iou)
+
+        # If run_infer_save returned an error summary, surface that
+        if isinstance(summary, dict) and summary.get('error'):
+            err_msg = summary.get('error')
+            print("[ERROR] run_infer_save reported error:", err_msg)
+            traceback.print_stack()
+            return jsonify({'error': 'inference failed', 'message': err_msg}), 500
+
+        annotated_url = f"/static/outputs/{out_name}" if out_name else None
+        return jsonify({
+            'detections': dets,
+            'summary': summary,
+            'annotated_image_url': annotated_url,
+            'source_filename': f.filename
+        })
+    except Exception as e:
+        # Print full python traceback to logs - critical for debugging Render 502s
+        print("[INFER HANDLER EXCEPTION]", str(e))
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
+        return jsonify({'error': 'internal server error', 'message': str(e)}), 500
+    finally:
+        # Attempt to remove the uploaded file to avoid disk filling
+        try:
+            if 'up' in locals() and os.path.exists(up):
+                os.remove(up)
+        except Exception:
+            pass
+
+# Batch inference with traceback logging
 @app.post('/api/v1/infer/batch')
 def infer_batch():
-    files = request.files.getlist('files') or request.files.getlist('images')
-    conf = float(request.args.get('conf', CONF))
-    iou = float(request.args.get('iou', IOU))
-    if not files:
-        return jsonify({'error': 'files are required'}), 400
-    items = []
-    for f in files:
-        try:
-            fn = f"{int(datetime.utcnow().timestamp()*1000)}_{uuid.uuid4().hex}_{f.filename}"
-            up = os.path.join(UPLOAD_DIR, fn)
-            f.save(up)
-            dets, out_name, summary = run_infer_save(up, conf, iou)
-            items.append({
-                'id': uuid.uuid4().hex,
-                'status': 'done',
-                'result': {
-                    'detections': dets,
-                    'summary': summary,
-                    'annotated_image_url': f"/static/outputs/{out_name}" if out_name else None,
-                    'source_filename': f.filename
-                }
-            })
-        except Exception as e:
-            items.append({'id': uuid.uuid4().hex, 'status': 'error', 'error': str(e)})
-    return jsonify({'batch_id': uuid.uuid4().hex, 'items': items})
-
+    try:
+        files = request.files.getlist('files') or request.files.getlist('images')
+        conf = float(request.args.get('conf', CONF))
+        iou = float(request.args.get('iou', IOU))
+        if not files:
+            return jsonify({'error': 'files are required'}), 400
+        items = []
+        for f in files:
+            try:
+                fn = f"{int(datetime.utcnow().timestamp()*1000)}_{uuid.uuid4().hex}_{f.filename}"
+                up = os.path.join(UPLOAD_DIR, fn)
+                f.save(up)
+                dets, out_name, summary = run_infer_save(up, conf, iou)
+                if isinstance(summary, dict) and summary.get('error'):
+                    items.append({'id': uuid.uuid4().hex, 'status': 'error', 'error': summary.get('error')})
+                else:
+                    items.append({
+                        'id': uuid.uuid4().hex,
+                        'status': 'done',
+                        'result': {
+                            'detections': dets,
+                            'summary': summary,
+                            'annotated_image_url': f"/static/outputs/{out_name}" if out_name else None,
+                            'source_filename': f.filename
+                        }
+                    })
+            except Exception as e:
+                print("[BATCH ITEM ERROR]", str(e))
+                traceback.print_exc()
+                items.append({'id': uuid.uuid4().hex, 'status': 'error', 'error': str(e)})
+            finally:
+                try:
+                    if 'up' in locals() and os.path.exists(up):
+                        os.remove(up)
+                except Exception:
+                    pass
+        return jsonify({'batch_id': uuid.uuid4().hex, 'items': items})
+    except Exception as e:
+        print("[BATCH HANDLER EXCEPTION]", str(e))
+        traceback.print_exc()
+        sys.stdout.flush(); sys.stderr.flush()
+        return jsonify({'error': 'internal server error', 'message': str(e)}), 500
 
 @app.get('/static/<path:path>')
 def serve_static(path):
     return send_from_directory(STATIC_DIR, path)
 
+# Debug endpoint to run inference on a built-in small image (helps reproduce without uploads)
+@app.get('/debug/infer_test')
+def debug_infer_test():
+    try:
+        # Pick a small image shipped in repo if available; otherwise inform the user
+        test_img = os.path.join(BASE_DIR, 'tests', 'data', 'images', 'zidane.jpg')
+        if not os.path.exists(test_img):
+            return jsonify({'error': 'no built-in test image available on server'}), 404
+        dets, out_name, summary = run_infer_save(test_img, CONF, IOU)
+        if isinstance(summary, dict) and summary.get('error'):
+            return jsonify({'error': 'inference failed', 'message': summary.get('error')}), 500
+        return jsonify({'ok': True, 'summary': summary, 'annotated_image_url': f"/static/outputs/{out_name}" if out_name else None})
+    except Exception as e:
+        print("[DEBUG INFER ERROR]", e)
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', '7000'))
+    # IMPORTANT: in production on Render, prefer running with gunicorn:
+    #   Add 'gunicorn>=20.1.0' to requirements.txt and set the start command to:
+    #   gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --timeout 300
+    #
+    # This file still supports local debug with python app.py
+    port = int(os.environ.get('PORT', '10000'))
+    print(f"[INFO] Starting dev server on 0.0.0.0:{port}, device={DEVICE}")
     app.run(host='0.0.0.0', port=port)
